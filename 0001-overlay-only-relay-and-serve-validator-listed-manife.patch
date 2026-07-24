@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Hamsa <josh.hamsa@gmail.com>
+Date: Fri, 11 Jul 2026 17:34:00 -0500
+Subject: [PATCH] overlay: only relay and serve validator-listed manifests
+
+A node that has accumulated a large number of untrusted manifests will
+re-broadcast all of them and, worse, dump its entire manifest cache to
+every newly connected peer in a single mtMANIFESTS message. On this node
+the cache held ~190k manifests, producing a ~58 MB message per new peer
+that starved the send queue and degraded peer churn and sync.
+
+Manifests for master keys that are not on any configured validator list
+(and are not trusted publisher keys) have no relay value to peers: they
+are not used for validation and are not persisted to the wallet DB. This
+change keeps accepting and caching every well-formed manifest locally --
+inbound processing is unchanged -- but restricts what is sent out:
+
+  * OverlayImpl::onManifests only adds a manifest to the relay set if its
+    master key is listed or is a trusted publisher key.
+
+  * OverlayImpl::getManifestsMessage applies the same filter when building
+    the manifest message sent on peer handshake, so the handshake message
+    is bounded by the size of the configured validator lists rather than
+    by the size of the local cache.
+
+The filter in getManifestsMessage is done in two passes because
+ValidatorList::listed() and trustedPublisher() call back into the
+ManifestCache via getMasterKey(); calling ManifestCache members from
+inside a forEachManifest callback would re-lock the cache mutex on the
+same thread. Pass 1 snapshots the master keys under the callback, the
+filter runs with the lock released, and pass 2 serializes only the keys
+that survived.
+
+A debug-level log line reports accepted vs. relayed counts so an operator
+can confirm the suppression is working.
+
+diff --git a/src/xrpld/overlay/detail/OverlayImpl.cpp b/src/xrpld/overlay/detail/OverlayImpl.cpp
+index b7af3b6..be4e8de 100644
+--- a/src/xrpld/overlay/detail/OverlayImpl.cpp
++++ b/src/xrpld/overlay/detail/OverlayImpl.cpp
+@@ -667,6 +667,10 @@ OverlayImpl::onManifests(
+ 
+     protocol::TMManifests relay;
+ 
++    // LOCAL-PATCH(manifest-flood): count accepted manifests so the operator
++    // can confirm spam is absorbed locally but not re-broadcast.
++    std::size_t acceptedCount = 0;
++
+     for (std::size_t i = 0; i < n; ++i)
+     {
+         auto& s = m->list().Get(i).stobject();
+@@ -679,7 +683,7 @@ OverlayImpl::onManifests(
+ 
+             if (result == ManifestDisposition::Accepted)
+             {
+-                relay.add_list()->set_stobject(s);
++                ++acceptedCount;
+ 
+                 // N.B.: this is important; the applyManifest call above moves
+                 //       the loaded Manifest out of the optional so we need to
+@@ -692,7 +696,17 @@ OverlayImpl::onManifests(
+                 // NOLINTBEGIN(bugprone-unchecked-optional-access) assert above
+                 app_.getOPs().pubManifest(*mo);
+ 
+-                if (app_.getValidators().listed(mo->masterKey))
++                bool const isListed = app_.getValidators().listed(mo->masterKey);
++
++                // LOCAL-PATCH(manifest-flood): only relay manifests whose
++                // master key is on a configured validator list (or is a
++                // trusted publisher key). Untrusted (spam) manifests are
++                // still accepted into the local cache above, but are not
++                // re-broadcast to all peers.
++                if (isListed || app_.getValidators().trustedPublisher(mo->masterKey))
++                    relay.add_list()->set_stobject(s);
++
++                if (isListed)
+                 {
+                     auto db = app_.getWalletDB().checkoutDb();
+                     addValidatorManifest(*db, serialized);
+@@ -707,6 +721,10 @@ OverlayImpl::onManifests(
+         }
+     }
+ 
++    // LOCAL-PATCH(manifest-flood): visibility into suppressed relays.
++    JLOG(journal.debug()) << "onManifests: accepted " << acceptedCount << ", relaying "
++                          << relay.list_size();
++
+     if (!relay.list().empty())
+     {
+         forEach([m2 = std::make_shared<Message>(relay, protocol::mtMANIFESTS)](
+@@ -1210,9 +1228,46 @@ OverlayImpl::getManifestsMessage()
+     {
+         protocol::TMManifests tm;
+ 
++        // LOCAL-PATCH(manifest-flood): instead of dumping the ENTIRE
++        // manifest cache to every new peer (with ~190k spam manifests that
++        // is a ~58 MB message which starves the send queue), only include
++        // manifests whose master key is on a configured validator list or
++        // is a trusted publisher key.
++        //
++        // This is done in two passes because ValidatorList::listed() and
++        // trustedPublisher() call back into the ManifestCache
++        // (getMasterKey), and calling ManifestCache member functions from
++        // within a forEachManifest callback re-locks the cache mutex from
++        // the same thread, which is UB (see the note on
++        // ManifestCache::forEachManifest in Manifest.h).
++        //
++        // Pass 1: snapshot the master keys currently in the cache.
++        std::vector<PublicKey> masterKeys;
++        app_.getValidatorManifests().forEachManifest(
++            [&masterKeys](std::size_t s) { masterKeys.reserve(s); },
++            [&masterKeys](Manifest const& manifest) { masterKeys.push_back(manifest.masterKey); });
++
++        // Filter (cache lock released): keep only listed / publisher keys.
++        std::set<PublicKey> wanted;
++        {
++            auto const& validators = app_.getValidators();
++            for (auto const& mk : masterKeys)
++            {
++                if (validators.listed(mk) || validators.trustedPublisher(mk))
++                    wanted.insert(mk);
++            }
++        }
++
++        // Pass 2: serialize only the wanted manifests. Reading `wanted`
++        // and calling Manifest/HashRouter members inside the callback is
++        // safe; only ManifestCache members are off-limits.
+         app_.getValidatorManifests().forEachManifest(
+-            [&tm](std::size_t s) { tm.mutable_list()->Reserve(s); },
+-            [&tm, &hr = app_.getHashRouter()](Manifest const& manifest) {
++            [&tm, &wanted](std::size_t) {
++                tm.mutable_list()->Reserve(static_cast<int>(wanted.size()));
++            },
++            [&tm, &wanted, &hr = app_.getHashRouter()](Manifest const& manifest) {
++                if (!wanted.contains(manifest.masterKey))
++                    return;
+                 tm.add_list()->set_stobject(manifest.serialized.data(), manifest.serialized.size());
+                 hr.addSuppression(manifest.hash());
+             });
+diff --git a/src/xrpld/overlay/detail/PeerImp.cpp b/src/xrpld/overlay/detail/PeerImp.cpp
+index 4e42d46..8b223d6 100644
+--- a/src/xrpld/overlay/detail/PeerImp.cpp
++++ b/src/xrpld/overlay/detail/PeerImp.cpp
+@@ -901,6 +901,12 @@ PeerImp::doProtocolStart()
+             });
+     }
+ 
++    // LOCAL-PATCH(manifest-flood): getManifestsMessage() is filtered to
++    // listed/publisher manifests (see OverlayImpl::getManifestsMessage), so
++    // this is now a small message rather than a full-cache dump. Escape
++    // hatch: if the filtered build ever misbehaves, commenting out the two
++    // lines below is a zero-risk fallback — it only makes this node a poor
++    // manifest relayer; inbound manifest processing is unaffected.
+     if (auto m = overlay_.getManifestsMessage())
+         send(m);
+ 
+-- 
+2.43.0
+
+base-commit: 58af1e6f188549074e5cd82c38d06bcf7e8d334d
