@@ -1,5 +1,16 @@
 # xrpld manifest-flood filter
 
+> **Status: retired — fixed upstream in xrpld 3.2.1 (2026-08-01).**
+> Following the manifest flood of 2026-07-31, upstream shipped the fix this patch worked
+> around: a per-manifest size cap, a per-message cap on untrusted manifests (inbound and
+> outbound), a cache cap of 100 unknown validator keys, and no disk persistence of
+> untrusted manifests. That is a superset of what this patch does — it additionally bounds
+> the local cache, which this patch deliberately left unbounded. If you are running this
+> patch, drop it and upgrade to stock 3.2.1 or later (per the official advisory: update,
+> wait 1–2 minutes, then restart once more to flush previously persisted flood manifests).
+> The node this was written for has done exactly that. The patch below is kept as a
+> historical record.
+
 A small out-of-tree patch for [XRPLF/rippled](https://github.com/XRPLF/rippled) (`xrpld`) that stops a
 node from re-broadcasting untrusted validator manifests and from dumping its entire manifest cache to
 every newly connected peer.
@@ -113,7 +124,8 @@ packaged binary — that keeps a rollback one `systemctl` edit away.
 
 ## Field status
 
-Running in production on a mainnet validator:
+Ran in production on a mainnet validator from 2026-07-24 until 2026-08-01, when the node
+moved to stock 3.2.1 (see the retirement notice above). While deployed:
 
 - `server_state: full`, 8 peers, stable across a 5+ hour observation window at time of writing
 - no excess logging, no manifest-related warnings
@@ -123,6 +135,9 @@ understand the two-pass note above, and test on a non-validating node before you
 validator key.
 
 ## Upstream
+
+This happened: xrpld 3.2.1 ships the fix (see the retirement notice at the top). The
+paragraph below is left as originally written.
 
 The right long-term home for this is upstream. If you hit the same problem, weighing in on an
 upstream issue is more useful than everyone carrying a private patch.
